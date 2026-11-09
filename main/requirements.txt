@@ -1,0 +1,12 @@
+# 설치: pip install -r main/requirements.txt  (Python 3.14에서 확인)
+
+# 데이터·모델 (main/main.py)
+numpy==2.5.2
+pandas==3.0.5
+scikit-learn==1.9.0
+torch==2.14.0
+matplotlib==3.11.2
+
+# 시뮬레이터 (pjh/app.py)
+streamlit==1.67.0
+plotly>=5.20
