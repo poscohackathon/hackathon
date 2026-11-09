@@ -15,13 +15,13 @@
     3. 점수(기본: 최대 이용률 + 0.5 × 이용률 편차)가 가장 낮은 후보를 고른다.
 
 사용 예
-    from optimize import load_data, limits_from_data, coil_from_data, optimize, physics_predictor
+    from optimize import load_data, limits_from_data, coil_from_data, optimize, final_gbdt_predictor
     df = load_data()
     lim = limits_from_data(df)
     coil = coil_from_data(2744, df)
-    result = optimize(coil, physics_predictor(df), lim)
+    result = optimize(coil, final_gbdt_predictor(df), lim)
 
-실행: python khj/optimize.py   (물리식과 GBDT를 바꿔 끼워 코일 2744를 최적화해 본다)
+실행: python khj/optimize.py   (물리식과 최종 GBDT를 바꿔 끼워 코일 2744를 최적화해 본다)
 """
 import sys
 import time
@@ -226,26 +226,14 @@ def physics_predictor(df):
     return predict_fn
 
 
-GBDT_FEATURES = ["Entry gauge (mm)", "Exit gauge (mm)", "Radius (mm)", "Width (mm)",
-                 "Temperature (K)", "draft", "reduction", "strain", "contact_len"]
-
-
-def gbdt_prepare(rows):
-    """GBDT 예시용 전처리: 숫자 변수 + 스탠드 번호 + 강종 번호 + 연주기."""
-    X = rows[GBDT_FEATURES].copy()
-    X["stand_no"] = rows["Stand ID"].str[1].astype(int)
-    X["grade_no"] = rows["Grade"].str[-2:].astype(int)
-    X["caster_S"] = (rows["Caster ID"] == "S").astype(int)
-    return X
-
-
-def train_example_gbdt(df):
-    """예시 GBDT. 실제 모델이 나오면 이 함수 대신 그 모델을 sklearn_predictor로 감싸면 된다."""
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    X = gbdt_prepare(df)
-    model = HistGradientBoostingRegressor(max_iter=400, learning_rate=0.06, random_state=0,
-                                          categorical_features=[X.columns.get_loc("grade_no")])
-    return model.fit(X, df["force_MN"])
+def final_gbdt_predictor(df):
+    """최종 하중 모델 (ojs/force_model.py: GBDT, 학습률 0.1, 나무 1,400개, 단조 제약).
+    단조 제약 = 같은 스탠드에서 더 누르면 하중이 줄지 않음. 제약이 없으면 최적화가
+    모델의 틀린 구간("더 눌렀는데 하중 감소")을 찾아가 엉뚱한 배분을 추천할 수 있다.
+    학습에 약 30초 걸린다."""
+    sys.path.insert(0, str(ROOT / "ojs"))
+    from force_model import make_predict_fn, train
+    return make_predict_fn(train(df))
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +266,9 @@ if __name__ == "__main__":
     res = optimize(coil, physics_predictor(df), lim)
     _print_result(f"물리식 M3, {time.time() - t1:.1f}초", res)
 
-    # 모델 2: GBDT (같은 optimize를 그대로 쓰고, 모델만 바꿔 끼운다)
-    model = train_example_gbdt(df)
+    # 모델 2: 최종 GBDT (같은 optimize를 그대로 쓰고, 모델만 바꿔 끼운다)
+    predict_fn = final_gbdt_predictor(df)
     t2 = time.time()
-    res = optimize(coil, sklearn_predictor(model, gbdt_prepare), lim)
-    _print_result(f"GBDT, {time.time() - t2:.1f}초", res)
+    res = optimize(coil, predict_fn, lim)
+    _print_result(f"GBDT (단조 제약), {time.time() - t2:.1f}초", res)
     print(f"\n총 {time.time() - t:.0f}초")
