@@ -1,7 +1,7 @@
 데이터 정리 기준 (pjh)
 ========================================
 
-대상: main/raw_data/metals.xlsx (시트 "All Grades Data")
+대상: main/raw_data/metals.csv (팀원이 xlsx를 변환해 올린 파일)
       열간압연 사상압연 F1~F5 하중 데이터, 38,980행 (코일 7,797개 x 5 스탠드)
 코드: pjh/pjh.ipynb
 
@@ -51,8 +51,9 @@
 - 제외된 코일은 이상한 코일이라기보다 기록이 밀린 코일이다.
   Grade05 외에는 제외로 인한 편향이 작다고 본다.
 - 속도, 성분, 윤활 정보는 원래 데이터에 없음
-- xlsx가 Strict OOXML 형식이라 pd.read_excel이 시트를 읽지 못함
-  -> pjh.ipynb의 load_metals()로 XML을 직접 파싱
+- CSV 뒤에 내용 없는 빈 컬럼 18개가 붙어 있음
+  -> pd.read_csv(..., usecols=range(10))로 앞 10개 컬럼만 읽음
+  (원본 xlsx는 Strict OOXML이라 pd.read_excel로는 읽히지 않았음)
 
 
 5. 모델링 때 지킬 것
