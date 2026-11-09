@@ -1,0 +1,23 @@
+# ojs 작업에 쓰는 라이브러리 (Python 3.14에서 확인)
+# 설치: pip install -r ojs/requirements.txt
+
+# 데이터 다루기
+numpy==2.5.2
+pandas==3.0.5
+
+# 그래프 (EDA, 발표 그림)
+matplotlib==3.11.2
+
+# 모델: 물리 기준 모델 회귀, GBDT, MLP
+scipy==1.18.1
+scikit-learn==1.9.0
+torch==2.14.0
+
+# 최적 조건 추천
+optuna==5.0.0
+
+# 시뮬레이터 화면
+streamlit==1.67.0
+
+# VS Code에서 노트북 실행
+ipykernel==7.4.0
