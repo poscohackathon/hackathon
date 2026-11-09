@@ -5,15 +5,15 @@
     streamlit run app.py
 
 [주의] 아래 세 가지는 '데모/가정'이며 화면에도 그렇게 표시된다.
-  1) 예측 모델   : 임시 선형 회귀 기준선 (최종 MLP/GBDT 모델로 교체 예정)  -> 3. 예측 모델 구간
+  1) 예측 모델   : GBDT (단조 제약, ojs/force_model.py). 앱 시작 때 한 번 학습 (약 20초)  -> 3. 예측 모델 구간
   2) 경고 기준   : 이용률 = 하중 / 스탠드별 과거 최대 하중(상위 0.5%). 주의 0.9, 위험 1.0 (실제 설비 정격 아님) -> 1. 설정 구간
-  3) 최적화      : 제약조건을 반영한 탐색 방식의 데모 알고리즘             -> 4. 최적화 구간
+  3) 최적화      : khj/optimize.py의 optimize() (과거 운영 범위 안 무작위 탐색)  -> 4. 최적화 구간
 
 코드 구성
   1. 설정(CONFIG)      : 색상, 이용률 기준, 파일 경로 등 바꾸기 쉬운 값
   2. 데이터 준비       : CSV 읽기, 연속성 깨진 코일 제외, 관측 범위 계산
   3. 예측 모델         : predict_batch()만 바꾸면 최종 모델로 교체 가능
-  4. 압하 배분 최적화  : 제약조건 반영 탐색 (데모)
+  4. 압하 배분 최적화  : khj/optimize.py 호출
   5. 경고 판정         : 정상 / 주의 / 위험
   6. AI Agent          : 규칙 기반 공정 분석 (LLM 연결 자리 포함)
   7. 시각화            : 공정 애니메이션, 그래프, 카드
@@ -31,7 +31,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
-from sklearn.linear_model import LinearRegression
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ojs"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "khj"))
+from force_model import train as train_force_model, make_predict_fn  # noqa: E402
+import optimize as khj_opt  # noqa: E402  (김하진 최적화 코드)
 
 # =====================================================================================
 # 1. 설정 (CONFIG)
@@ -65,11 +70,6 @@ CONCENTRATION_ALERT_SHARE = 0.30   # 한 스탠드가 전체 하중의 30%를 �
 SAMPLE_COILS = {2744: "메인 시연 · F1 병목", 2599: "보조 시연 · F1 한계 직전", 2086: "후보 · Grade01",
                 6175: "후보 · Grade06", 6920: "후보 · Grade08"}
 
-# ---- 최적화 설정 (데모 알고리즘) --------------------------------------------------------
-MAX_SHIFT_DEFAULT = 8.0            # 현재 압하율에서 스탠드당 최대 조정폭 (%p). 학습 범위 밖 외삽을 막기 위함
-N_SAMPLES = 25000                  # 라운드당 탐색 후보 수
-N_ROUNDS = 4                       # 탐색 라운드 수 (라운드마다 최적 후보 주변으로 좁힘)
-
 # ---- 색상 (다크 테마) ------------------------------------------------------------------
 C_BG, C_CARD, C_BORDER = "#0c0c0f", "#17171c", "#2b2b33"
 C_TEXT, C_MUTED = "#ececf0", "#9b9ba6"
@@ -80,9 +80,6 @@ STATUS = {
     "warn": ("주의", C_WARN),
     "danger": ("위험", C_DANGER),
 }
-
-NUM_FEATURES = 9  # 수치 변수 개수 (입구/출구 두께, 압하량, 압하율, 변형률, 접촉길이, 롤 반경, 폭, 온도)
-
 
 # =====================================================================================
 # 2. 데이터 준비
@@ -109,32 +106,16 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def featurize(entry, exit_, radius, width, temp, stand_idx, grade_idx, n_grades):
-    """예측 모델 입력 행렬 (행 = 스탠드 하나). 모든 인자는 같은 길이의 1차원 배열."""
-    draft = np.clip(entry - exit_, 1e-3, None)
-    red = draft / entry
-    strain = np.log(entry / np.clip(exit_, 1e-3, None))
-    contact = np.sqrt(radius * draft)
-    num = np.column_stack([entry, exit_, draft, red, strain, contact, radius, width, temp])
-    st_oh = np.eye(5)[stand_idx]
-    gr_oh = np.eye(n_grades)[grade_idx]
-    return np.hstack([num, st_oh, gr_oh])
-
-
-@st.cache_resource(show_spinner="학습 데이터와 임시 예측 모델을 준비하는 중입니다...")
+@st.cache_resource(show_spinner="학습 데이터와 GBDT 예측 모델을 준비하는 중입니다 (처음 한 번, 약 20초)...")
 def load_resources() -> dict:
-    """데이터 읽기, 관측 범위 계산, 임시 예측 모델 학습 (앱 실행 중 한 번만 수행)."""
+    """데이터 읽기, 관측 범위 계산, GBDT 예측 모델 학습 (앱 실행 중 한 번만 수행)."""
     if not DATA_CSV.exists():
         return {"error": f"데이터 파일을 찾을 수 없습니다: {DATA_CSV}"}
     raw = pd.read_csv(DATA_CSV, usecols=range(10))   # CSV 뒤쪽 빈 컬럼 18개는 버린다
     d = add_features(drop_broken_coils(raw))
 
     grades = sorted(d["Grade"].unique())
-    stand_idx = d["Stand ID"].map({s: i for i, s in enumerate(STANDS)}).to_numpy()
-    grade_idx = d["Grade"].map({g: i for i, g in enumerate(grades)}).to_numpy()
-    X = featurize(d["Entry gauge (mm)"].to_numpy(), d["Exit gauge (mm)"].to_numpy(), d["Radius (mm)"].to_numpy(),
-                  d["Width (mm)"].to_numpy(), d["Temperature (K)"].to_numpy(), stand_idx, grade_idx, len(grades))
-    model = LinearRegression().fit(X, d["force_MN"].to_numpy())
+    model = make_predict_fn(train_force_model(d))   # 최종 모델 (ojs/force_model.py), 앱 시작 때 한 번
 
     q = d.groupby("Stand ID")["reduction"].quantile([0.01, 0.5, 0.99]).unstack().loc[STANDS]
     first, last = d[d["Stand ID"] == "F1"], d[d["Stand ID"] == "F5"]
@@ -171,7 +152,8 @@ def load_resources() -> dict:
             k = pos[cid]
             coils[cid] = {"grade": str(gr5[k, 0]), "caster": str(ca5[k, 0]), "width": float(wid5[k, 0]),
                           "entry": float(ent5[k, 0]), "final": float(ex5[k, 4]), "temp_c": float(tmp5[k, 0]) - 273.15,
-                          "reds": red5[k].astype(float), "forces": f5[k].astype(float)}
+                          "reds": red5[k].astype(float), "forces": f5[k].astype(float),
+                          "radii": col5("Radius (mm)")[k].astype(float), "temps": tmp5[k].astype(float)}
 
     return {
         "coils": coils, "red_min": np.floor(red_min * 200) / 200, "red_max": np.ceil(red_max * 200) / 200,
@@ -198,8 +180,8 @@ def load_resources() -> dict:
 # =====================================================================================
 # 3. 예측 모델  ->  최종 모델이 정해지면 predict_batch()만 교체하면 된다
 # =====================================================================================
-MODEL_NAME = "임시 모델 (선형 회귀 기준선)"
-MODEL_IS_PLACEHOLDER = True
+MODEL_NAME = "GBDT (단조 제약)"
+MODEL_IS_PLACEHOLDER = False
 
 
 def stand_temps(res: dict, temp1_c: float) -> np.ndarray:
@@ -207,12 +189,23 @@ def stand_temps(res: dict, temp1_c: float) -> np.ndarray:
     return temp1_c + 273.15 + (res["temp_med"] - res["temp_med"][0])
 
 
-def predict_batch(res: dict, grade: str, width: float, entry: float, exits: np.ndarray, temps: np.ndarray) -> np.ndarray:
+def stand_conditions(res: dict, inp: dict, smp: dict | None) -> tuple[np.ndarray, np.ndarray]:
+    """스탠드별 롤 반경(mm)과 온도(K).
+    샘플 코일을 불러왔으면 그 코일의 실제 값을 쓰고 (F1 온도를 바꾸면 같은 만큼 평행 이동), 아니면 과거 중앙값을 쓴다."""
+    if smp:
+        temps = np.asarray(smp["temps"]) + (inp["temp_c"] - smp["inputs"]["temp_c"])
+        return np.asarray(smp["radii"]), temps
+    return res["radius_med"], stand_temps(res, inp["temp_c"])
+
+
+def predict_batch(res: dict, grade: str, width: float, entry: float, exits: np.ndarray, temps: np.ndarray,
+                  radii: np.ndarray) -> np.ndarray:
     """여러 압하 배분 후보의 스탠드별 하중(MN)을 한 번에 예측한다.
 
     Args:
         exits: (후보 수, 5) 스탠드별 출구 두께 (mm)
         temps: (5,) 스탠드별 온도 (K)
+        radii: (5,) 스탠드별 롤 반경 (mm)
     Returns:
         (후보 수, 5) 예측 하중 (MN)
 
@@ -220,15 +213,15 @@ def predict_batch(res: dict, grade: str, width: float, entry: float, exits: np.n
     """
     n = exits.shape[0]
     entries = np.hstack([np.full((n, 1), entry), exits[:, :-1]])
-    stand_idx = np.tile(np.arange(5), n)
-    grade_idx = np.full(n * 5, res["grades"].index(grade))
-    X = featurize(entries.ravel(), exits.ravel(), np.tile(res["radius_med"], n), np.full(n * 5, width),
-                  np.tile(temps, n), stand_idx, grade_idx, res["n_grades"])
-    return np.clip(res["model"].predict(X), 0, None).reshape(n, 5)
+    rows = pd.DataFrame({"Grade": grade, "Stand ID": np.tile(STANDS, n),
+                         "Entry gauge (mm)": entries.ravel(), "Exit gauge (mm)": exits.ravel(),
+                         "Radius (mm)": np.tile(radii, n), "Width (mm)": width,
+                         "Temperature (K)": np.tile(temps, n)})
+    return res["model"](rows).reshape(n, 5)
 
 
 # =====================================================================================
-# 4. 압하 배분 최적화 (제약조건 반영 탐색 - 데모용 알고리즘)
+# 4. 압하 배분 최적화 (khj/optimize.py)
 # =====================================================================================
 def exits_from_reductions(entry: float, reds: np.ndarray) -> np.ndarray:
     """압하율 (…, 5) -> 스탠드별 출구 두께 (…, 5)."""
@@ -241,60 +234,26 @@ def default_reductions(res: dict, entry: float, final: float) -> np.ndarray:
     return 1.0 - np.exp(-eps)
 
 
-def optimize_schedule(res, grade, width, entry, final, temps, cur_reds, max_shift, seed=0) -> dict:
-    """총 두께 감소량(= 최종 두께)을 유지하면서 하중 집중을 줄이는 압하 배분을 탐색한다.
+def optimize_schedule(res: dict, inp: dict, cur_reds: np.ndarray) -> dict:
+    """김하진 khj/optimize.py의 optimize()로 압하 배분을 추천한다 (발표 숫자와 같은 알고리즘).
 
-    제약조건
-      - 최종 출구 두께 = 목표값 (F5 압하율은 F1~F4로부터 계산되어 항상 일치)
-      - 모든 스탠드의 압하율은 과거 관측 범위(1~99%) 안
-      - 현재 압하율에서 스탠드당 ±max_shift(%p) 이내 (학습 범위 밖으로 나가는 것을 막음)
-      - 이용률 1.0 이상(과거 최대 하중 이상)이 되는 스탠드가 있는 후보는 제외
-    목적: 최대 이용률 + 0.5 x 스탠드 간 이용률 표준편차 를 최소화 (이용률 = 하중 / 스탠드별 과거 최대 하중)
-    방식: 무작위 탐색 후 최적 후보 주변으로 범위를 좁혀 반복 (데모용 탐색 알고리즘, 수학적 최적해 보장 없음)
+    제약조건: 최종 두께 = 목표값, 모든 스탠드 압하율은 과거 운영 범위(1~99%) 안
+    목적: 최대 이용률 + 0.5 x 스탠드 간 이용률 표준편차 최소화 (이용률 = 하중 / 스탠드별 과거 최대 하중)
+    방식: 범위 안 무작위 후보 3,000개를 GBDT로 한 번에 예측해 점수가 가장 낮은 것을 고른다 (seed 0)
     """
-    rng = np.random.default_rng(seed)
-    lo, hi = res["red_lo"], res["red_hi"]
-    shift = max_shift / 100.0
-    # 현재 값은 항상 탐색 범위에 포함되도록 범위를 잡는다
-    lo4 = np.minimum(cur_reds[:4], np.maximum(lo[:4], cur_reds[:4] - shift))
-    hi4 = np.maximum(cur_reds[:4], np.minimum(hi[:4], cur_reds[:4] + shift))
-    lo5, hi5 = min(lo[4], cur_reds[4]), max(hi[4], cur_reds[4])
-    caps = caps_arr()
-
-    def evaluate(r4):
-        prod4 = np.prod(1.0 - r4, axis=1)
-        r5 = 1.0 - final / (entry * prod4)
-        reds = np.column_stack([r4, r5])
-        ok = (r5 >= lo5) & (r5 <= hi5)
-        forces = predict_batch(res, grade, width, entry, exits_from_reductions(entry, reds), temps)
-        util = forces / caps                                              # 스탠드별 이용률
-        over = np.clip(util - 0.999 * DANGER_UTIL, 0, None).sum(axis=1)   # 이용률 1.0 이상인 정도
-        obj = util.max(axis=1) + 0.5 * util.std(axis=1) + 1000.0 * over
-        obj = np.where(ok, obj, np.inf)
-        return reds, forces, obj, over
-
-    best_r4 = cur_reds[:4].copy()
-    _, _, base_obj, _ = evaluate(best_r4[None, :])
-    best_obj = float(base_obj[0])
-    sigma = (hi4 - lo4) / 2.0
-    evaluated = 0
-    for rnd in range(N_ROUNDS):
-        if rnd == 0:
-            cand = rng.uniform(lo4, hi4, size=(N_SAMPLES, 4))
-        else:
-            cand = np.clip(best_r4 + rng.normal(0, 1, size=(N_SAMPLES, 4)) * sigma, lo4, hi4)
-        reds, forces, obj, over = evaluate(cand)
-        evaluated += len(cand)
-        i = int(np.argmin(obj))
-        if obj[i] < best_obj:
-            best_obj, best_r4 = float(obj[i]), cand[i].copy()
-        sigma = sigma * 0.5
-
-    r5 = 1.0 - final / (entry * float(np.prod(1.0 - best_r4)))
-    best = np.append(best_r4, r5)
-    _, _, _, over_best = evaluate(best_r4[None, :])
-    return {"reductions": best, "n_evaluated": evaluated, "max_shift": max_shift,
-            "feasible": bool(over_best[0] == 0), "changed": bool(np.abs(best - cur_reds).max() > 1e-4)}
+    coil = khj_opt.Coil(grade=inp["grade"], caster=inp["caster"], width=inp["width"], h0=inp["entry"],
+                        h_final=inp["final"], radii=list(inp["radii"]), temps_K=list(inp["temps"]),
+                        reductions=list(cur_reds))
+    lim = khj_opt.Limits(red_lo=res["red_lo"], red_hi=res["red_hi"], cap=caps_arr(), temp_K=res["temp_med"],
+                         grades=res["grades"])
+    try:
+        out = khj_opt.optimize(coil, res["model"], lim)
+    except ValueError as e:
+        return {"error": str(e)}
+    best = np.asarray(out["best"]["reductions"], dtype=float)
+    return {"reductions": best, "n_evaluated": out["n_candidates"],
+            "feasible": bool(out["best"]["util"].max() < DANGER_UTIL),
+            "changed": bool(np.abs(best - cur_reds).max() > 1e-4)}
 
 
 # =====================================================================================
@@ -314,8 +273,8 @@ def build_result(res: dict, inp: dict, reds: np.ndarray, label: str) -> dict:
     entry = inp["entry"]
     exits = exits_from_reductions(entry, reds)
     entries = np.concatenate([[entry], exits[:-1]])
-    temps = stand_temps(res, inp["temp_c"])
-    forces = predict_batch(res, inp["grade"], inp["width"], entry, exits[None, :], temps)[0]
+    temps, radii = inp["temps"], inp["radii"]
+    forces = predict_batch(res, inp["grade"], inp["width"], entry, exits[None, :], temps, radii)[0]
     drafts = entries - exits
     status = [classify(f, s) for f, s in zip(forces, STANDS)]
     in_range = [bool(res["red_lo"][i] <= reds[i] <= res["red_hi"][i]) for i in range(5)]
@@ -324,7 +283,7 @@ def build_result(res: dict, inp: dict, reds: np.ndarray, label: str) -> dict:
     return {
         "label": label, "reds": np.asarray(reds), "exits": exits, "entries": entries, "drafts": drafts,
         "forces": forces, "shares": shares, "status": status, "in_range": in_range, "temps": temps,
-        "contact": np.sqrt(res["radius_med"] * drafts),
+        "contact": np.sqrt(radii * drafts),
         "util": forces / caps_arr(), "max_util": float(np.max(forces / caps_arr())),
         "total": float(forces.sum()), "max": float(forces.max()), "top": top,
         "mean": float(forces.mean()), "cv": float(forces.std() / forces.mean()),
@@ -545,7 +504,7 @@ def build_twin_html(res: dict, inp: dict, cur: dict, opt: dict | None, actual=No
     """3D 디지털 트윈 화면(HTML)을 만든다.
 
     - 장면(애니메이션)은 twin/scene.html 이 브라우저 안에서 실행한다. Streamlit이 다시 그리지 않으므로 끊기지 않는다.
-    - 소재 이동, 온도, 속도는 시뮬레이션 값이다. 하중과 압하 배분은 AI 예측(임시 모델) 값이다.
+    - 소재 이동, 온도, 속도는 시뮬레이션 값이다. 하중과 압하 배분은 AI 예측(GBDT) 값이다.
     - 달궈진 소재에는 열 발광을 쓰지만, 롤과 스탠드와 상태 표시에는 빛 번짐(네온) 효과를 쓰지 않는다.
     """
     scene = (TWIN_DIR / "scene.html").read_text(encoding="utf-8")
@@ -618,7 +577,7 @@ def render_actual_compare(cur: dict, actual: np.ndarray, smp: dict):
     c1, c2 = st.columns([3, 2])
     fig = go.Figure()
     fig.add_bar(x=STANDS, y=actual, name="실측", marker_color="#cfcfd6", text=[f"{v:.1f}" for v in actual], textposition="outside")
-    fig.add_bar(x=STANDS, y=cur["forces"], name="예측 (임시 모델)", marker_color=C_STEEL,
+    fig.add_bar(x=STANDS, y=cur["forces"], name="예측 (GBDT)", marker_color=C_STEEL,
                 text=[f"{v:.1f}" for v in cur["forces"]], textposition="outside")
     plotly_dark(fig, 300, "스탠드별 하중 (MN)")
     fig.update_layout(barmode="group", yaxis_range=[0, max(actual.max(), cur["max"]) * 1.25])
@@ -629,7 +588,7 @@ def render_actual_compare(cur: dict, actual: np.ndarray, smp: dict):
                                    "예측 이용률": np.round(cur["util"], 2)}), hide_index=True, width="stretch")
         st.markdown(f"<div class='note'>평균 절대 오차(MAE) <b>{np.abs(err).mean():.2f} MN</b> · 최대 오차 {np.abs(err).max():.2f} MN<br>"
                     f"최대 이용률: 실측 <b>{(actual / caps).max():.2f}</b> / 예측 <b>{cur['max_util']:.2f}</b><br>"
-                    "현재는 임시 모델(선형 회귀)이라 오차가 큽니다. 최종 모델을 연결하면 갱신됩니다.</div>", unsafe_allow_html=True)
+                    "예측 모델: GBDT (단조 제약). 처음 보는 코일 기준 평균 오차 0.44 MN.</div>", unsafe_allow_html=True)
 
 
 def sidebar_summary(cur: dict, opt: dict | None):
@@ -706,7 +665,7 @@ def init_state(res: dict):
     rep = res["rep"]
     defaults = {"in_grade": rep["grade"], "in_width": int(round(rep["width"])), "in_entry": round(rep["entry"], 1),
                 "in_final": round(rep["final"], 2), "in_temp": int(round(rep["temp_c"])), "in_manual": False,
-                "in_shift": MAX_SHIFT_DEFAULT, "in_sample": 0, "sample": None, "cur": None, "opt": None, "opt_meta": None,
+                "in_sample": 0, "sample": None, "cur": None, "opt": None, "opt_meta": None,
                 "anim": None, "agent_new": False}
     reds = default_reductions(res, rep["entry"], rep["final"])
     for i in range(4):
@@ -753,10 +712,12 @@ def load_sample(res: dict):
     c = res["coils"][cid]
     ss.update(in_grade=c["grade"], in_width=int(round(c["width"])), in_entry=round(c["entry"], 2),
               in_final=round(c["final"], 2), in_temp=int(round(c["temp_c"])), in_manual=True)
-    reds4 = [round(float(c["reds"][i]) * 100, 2) for i in range(4)]
+    reds4 = [round(float(c["reds"][i]) * 100, 4) for i in range(4)]
     for i in range(4):
         ss[f"in_r{i + 1}"] = reds4[i]
     ss["sample"] = {"id": cid, "caster": c["caster"], "actual": [float(v) for v in c["forces"]],
+                    "radii": [float(v) for v in c["radii"]], "temps": [float(v) for v in c["temps"]],
+                    "exact": dict(width=c["width"], entry=c["entry"], final=c["final"]),   # 슬라이더 반올림 전 원래 값
                     "inputs": dict(grade=c["grade"], width=float(ss["in_width"]), entry=ss["in_entry"], final=ss["in_final"],
                                    temp_c=float(ss["in_temp"]), reds4=[v / 100 for v in reds4])}
 
@@ -785,7 +746,8 @@ def sidebar_inputs(res: dict) -> dict:
                      format_func=lambda c: "(직접 입력)" if not c else f"코일 {c} · {SAMPLE_COILS[c]}",
                      help="실제 조업 코일의 조건과 압하 배분을 불러옵니다. 불러온 조건을 바꾸지 않으면 실측 하중과 예측을 비교해 보여 줍니다.")
         if ss.get("sample"):
-            st.caption(f"연주기 {ss['sample']['caster']} · 현재 임시 모델은 연주기를 입력으로 쓰지 않습니다.")
+            st.caption(f"연주기 {ss['sample']['caster']} · 롤 반경과 스탠드별 온도는 이 코일의 실측값을 씁니다. "
+                       "예측 모델은 연주기를 입력으로 쓰지 않습니다.")
             st.button("↺ 이 코일 조건으로 되돌리기", on_click=load_sample, args=(res,), width="stretch",
                       help="슬라이더를 바꾼 뒤 불러온 코일의 원래 조건으로 되돌립니다.")
 
@@ -807,14 +769,11 @@ def sidebar_inputs(res: dict) -> dict:
             st.caption("F1~F4를 정하면 F5는 목표 두께에 맞춰 자동 계산됩니다.")
             reds_in = [st.slider(f"{STANDS[i]} 압하율 (%)", round(res["red_min"][i] * 100, 1),
                                  round(res["red_max"][i] * 100, 1), step=0.5, key=f"in_r{i + 1}") / 100 for i in range(4)]
-        with st.expander("최적화 설정"):
-            shift = st.slider("스탠드당 최대 조정폭 (%p)", 2.0, 15.0, step=1.0, key="in_shift",
-                              help="현재 압하율에서 이만큼까지만 바꿉니다. 작을수록 과거 운영 방식에 가까운 안전한 추천이 됩니다.")
         st.markdown("<br>", unsafe_allow_html=True)
         run = st.button("▶  시뮬레이션 실행", type="primary", width="stretch")
         optimize = st.button("⚙  압하 배분 최적화", width="stretch")
     return dict(grade=grade, width=float(width), entry=float(entry), final=float(final), temp_c=float(temp),
-                manual=manual, reds_in=reds_in, shift=float(shift), run=run, optimize=optimize)
+                manual=manual, reds_in=reds_in, run=run, optimize=optimize)
 
 
 def validate(inp: dict, res: dict) -> tuple[bool, str, np.ndarray | None]:
@@ -845,19 +804,27 @@ def main():
     ss = st.session_state
 
     # ---- 헤더
-    model_tag = f"<span class='tag'>예측 모델: {MODEL_NAME}</span>" if MODEL_IS_PLACEHOLDER else "<span class='tag live'>학습 모델</span>"
+    model_tag = f"<span class='tag{'' if MODEL_IS_PLACEHOLDER else ' live'}'>예측 모델: {MODEL_NAME}</span>"
     limit_tag = "<span class='tag'>경고 기준: 과거 최대 하중 대비 이용률</span>"
     st.markdown(f"<div class='topbar'><span class='tb-title'>HOT FINISHING MILL · F1~F5 DIGITAL TWIN</span>"
-                f"<div>{model_tag}{limit_tag}<span class='tag'>최적화: 제약 기반 탐색(데모)</span></div></div>",
+                f"<div>{model_tag}{limit_tag}<span class='tag live'>최적화: 과거 운영 범위 안 탐색</span></div></div>",
                 unsafe_allow_html=True)
 
     inp = sidebar_inputs(res)
+    smp = ss.get("sample")
+    matched = sample_matches(inp, smp)   # 불러온 코일 조건 그대로인지 (그럴 때만 실측과 비교)
+    if smp:   # 불러온 코일의 폭·두께를 그대로 두었으면 슬라이더 반올림 전 원래 값으로 계산한다 (발표 숫자와 일치)
+        i = smp["inputs"]
+        if abs(inp["width"] - i["width"]) < 0.5 and abs(inp["entry"] - i["entry"]) < 0.005 and abs(inp["final"] - i["final"]) < 0.005:
+            inp.update(smp["exact"])
     ok, err, cur_reds = validate(inp, res)
     if not ok:
         st.error(err)
         st.stop()
 
     # ---- 실행 버튼 처리
+    inp["radii"], inp["temps"] = stand_conditions(res, inp, smp)
+    inp["caster"] = smp["caster"] if smp else "S"
     sig = (inp["grade"], inp["width"], inp["entry"], inp["final"], inp["temp_c"], tuple(np.round(cur_reds, 4)))
     if inp["run"] or inp["optimize"] or ss["cur"] is None:
         if ss["cur"] is None or inp["run"] or ss["cur"]["sig"] != sig:
@@ -868,15 +835,16 @@ def main():
             ss["agent_new"] = bool(inp["run"] or inp["optimize"])
     if inp["optimize"]:
         with st.spinner("제약조건 안에서 압하 배분을 탐색하는 중..."):
-            temps = stand_temps(res, inp["temp_c"])
-            meta = optimize_schedule(res, inp["grade"], inp["width"], inp["entry"], inp["final"], temps, cur_reds, inp["shift"])
+            meta = optimize_schedule(res, inp, cur_reds)
+        if "error" in meta:
+            st.warning(f"최적화할 수 없습니다: {meta['error']}")
+        else:
             ss["opt"] = build_result(res, inp, meta["reductions"], "최적화 후")
             ss["opt_meta"] = meta
-        ss["anim"], ss["agent_new"] = "opt", True
+            ss["anim"], ss["agent_new"] = "opt", True
 
     cur, opt, opt_meta = ss["cur"], ss["opt"], ss["opt_meta"]
-    smp = ss.get("sample")
-    actual = np.array(smp["actual"]) if (smp and cur["sig"] == sig and sample_matches(inp, smp)) else None   # 불러온 조건 그대로일 때만 실측 비교
+    actual = np.array(smp["actual"]) if (smp and cur["sig"] == sig and matched) else None   # 불러온 조건 그대로일 때만 실측 비교
     if cur["sig"] != sig:
         st.markdown("<div class='alert info'>입력값이 바뀌었습니다. 아래 결과는 이전 조건 기준입니다. "
                     "<b>시뮬레이션 실행</b>을 눌러 갱신하세요.</div>", unsafe_allow_html=True)
@@ -917,7 +885,7 @@ def main():
         components.html(twin_html, height=1250)
     ss["anim"] = None
     st.caption("3D 장면의 소재 이동, 온도, 속도는 시뮬레이션 값이며 실측 데이터가 아닙니다. "
-               "F1~F5 하중과 압하 배분은 AI 예측(임시 모델) 값이고, 이용률은 과거 최대 하중 대비 값(실제 설비 정격 아님)입니다.")
+               "F1~F5 하중과 압하 배분은 AI 예측(GBDT) 값이고, 이용률은 과거 최대 하중 대비 값(실제 설비 정격 아님)입니다.")
     if actual is not None:
         render_actual_compare(cur, actual, smp)
     elif smp:
@@ -980,8 +948,9 @@ def main():
                              "학습 범위": "안" if r["in_range"][i] else "밖"})
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     if opt_meta is not None:
-        st.markdown(f"<div class='note'>최적화: 총 두께 감소량 유지, 압하율은 과거 관측 범위(1~99%) 안, 현재 대비 ±{opt_meta['max_shift']:.0f}%p 이내, "
-                    "이용률 1.0 이상 후보 제외. 무작위 탐색을 좁혀 가는 <b>데모용 알고리즘</b>이며 수학적 최적해를 보장하지 않습니다.</div>",
+        st.markdown(f"<div class='note'>최적화(khj/optimize.py): 최종 두께 유지, 모든 스탠드 압하율은 과거 운영 범위(1~99%) 안. "
+                    f"범위 안 무작위 후보 {opt_meta['n_evaluated']:,}개를 GBDT로 예측해 '최대 이용률 + 0.5 × 이용률 편차'가 가장 작은 배분을 고릅니다. "
+                    "수학적 최적해를 보장하지는 않습니다.</div>",
                     unsafe_allow_html=True)
 
 
