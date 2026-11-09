@@ -657,6 +657,8 @@ CSS = f"""
 .block-container {{ padding-top: 1.2rem; max-width: 1500px; }}
 .topbar {{ display:flex; align-items:center; justify-content:space-between; padding: 6px 2px 10px 2px; }}
 .tb-title {{ color:{C_MUTED}; font-size:0.8rem; letter-spacing:0.14em; }}
+.sb-team {{ display:inline-block; margin:0 0 10px 0; padding:3px 14px; border:1px solid {C_ACCENT}; border-radius:999px;
+  color:{C_ACCENT}; font-size:0.9rem; font-weight:700; letter-spacing:0.18em; }}
 .sb-title {{ color:{C_MUTED}; font-size:0.66rem; letter-spacing:0.12em; line-height:1.5; margin-bottom:2px; }}
 .sb-brand {{ font-size:1.35rem; font-weight:700; letter-spacing:0.12em; margin-bottom:10px; }}
 .sb-brand span {{ color:{C_ACCENT}; }}
@@ -772,7 +774,8 @@ def sample_matches(inp: dict, smp: dict | None) -> bool:
 def sidebar_inputs(res: dict) -> dict:
     ss = st.session_state
     with st.sidebar:
-        st.markdown("<div class='sb-title'>INTELLIGENT HOT ROLLING<br>DIGITAL TWIN SYSTEM</div>"
+        st.markdown("<div class='sb-team'>great science</div>"
+                    "<div class='sb-title'>INTELLIGENT HOT ROLLING<br>DIGITAL TWIN SYSTEM</div>"
                     "<div class='sb-brand'>STEEL <span>FLOW</span> AI</div>"
                     "<div class='panel-t'>공정 조건 <span>INPUT</span></div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
@@ -921,9 +924,8 @@ def main():
         st.markdown(f"<div class='alert info'>코일 {smp['id']}의 조건이 바뀌어 실측과 비교할 수 없습니다. 바꾼 조건의 하중은 모델 예측값입니다.</div>",
                     unsafe_allow_html=True)
 
-    # ---- 경고 + AI Agent
-    left, right = st.columns([5, 4])
-    with left:
+    # ---- 설비 경고 (위) / AI 공정 분석 (아래): 서로 다른 구역으로 나눠서 위아래로 둔다
+    with st.container():
         st.markdown("<div class='panel-t'>설비 경고 <span>WARNING</span></div>", unsafe_allow_html=True)
         cols = st.columns(5)
         for i in range(5):
@@ -943,12 +945,12 @@ def main():
         caps_txt = " / ".join(f"{s} {c:.1f}" for s, c in zip(STANDS, caps_arr()))
         st.markdown(f"<div class='note'>※ 이용률 = 예측 하중 ÷ 스탠드별 과거 최대 하중(데이터 상위 0.5%). 주의 {CAUTION_UTIL:.1f} 이상, 위험 {DANGER_UTIL:.1f} 이상. "
                     f"과거 최대 하중(MN): {caps_txt}. 실제 설비 정격이 아니므로 하중(MN)과 이용률을 함께 보세요.</div>", unsafe_allow_html=True)
-    with right:
+    with st.container():
         st.markdown("<div class='panel-t'>AI 공정 분석 <span>AGENT</span></div>", unsafe_allow_html=True)
         ctx = dict(res=res, inp=inp, cur=cur, opt=opt, opt_meta=opt_meta)
         llm_text = analyze_with_llm(ctx)
         sections = analyze_process(res, inp, cur, opt, opt_meta) if llm_text is None else [("AI 분석", llm_text)]
-        box = st.container(height=620, border=True)
+        box = st.container(border=True)
         with box:
             if ss["agent_new"]:
                 st.write_stream(stream_text(sections))   # 새 결과일 때만 타자 효과
