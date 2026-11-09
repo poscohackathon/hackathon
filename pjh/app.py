@@ -4,13 +4,13 @@
     pip install -r requirements.txt
     streamlit run app.py
 
-[주의] 아래 세 가지는 '데모용'이며 화면에도 그렇게 표시된다.
+[주의] 아래 세 가지는 '데모/가정'이며 화면에도 그렇게 표시된다.
   1) 예측 모델   : 임시 선형 회귀 기준선 (최종 MLP/GBDT 모델로 교체 예정)  -> 3. 예측 모델 구간
-  2) 설비 기준   : 가상의 주의/위험 하중 기준 (실제 설비 허용 하중 아님)    -> 1. 설정 구간 LIMITS
+  2) 경고 기준   : 이용률 = 하중 / 스탠드별 과거 최대 하중(상위 0.5%). 주의 0.9, 위험 1.0 (실제 설비 정격 아님) -> 1. 설정 구간
   3) 최적화      : 제약조건을 반영한 탐색 방식의 데모 알고리즘             -> 4. 최적화 구간
 
 코드 구성
-  1. 설정(CONFIG)      : 색상, 설비 기준, 파일 경로 등 바꾸기 쉬운 값
+  1. 설정(CONFIG)      : 색상, 이용률 기준, 파일 경로 등 바꾸기 쉬운 값
   2. 데이터 준비       : CSV 읽기, 연속성 깨진 코일 제외, 관측 범위 계산
   3. 예측 모델         : predict_batch()만 바꾸면 최종 모델로 교체 가능
   4. 압하 배분 최적화  : 제약조건 반영 탐색 (데모)
@@ -39,11 +39,26 @@ from sklearn.linear_model import LinearRegression
 DATA_CSV = Path(__file__).resolve().parent.parent / "main" / "raw_data" / "metals.csv"
 STANDS = ["F1", "F2", "F3", "F4", "F5"]
 
-# ---- 설비 하중 기준 (데모용 가상 기준!) -------------------------------------------------
-# 실제 설비 허용 하중 데이터가 없어 임의로 둔 값이다. 실제 기준이 생기면 이 표만 바꾸면 된다.
-#   스탠드: (주의 기준 MN, 위험 기준 MN)
-LIMITS = {s: (29.0, 32.0) for s in STANDS}
-LIMITS_ARE_DEMO = True
+# ---- 경고 기준: 이용률 (실제 설비 정격이 아니다!) ---------------------------------------
+#   이용률 = 예측 하중 / 그 스탠드의 과거 최대 하중 (데이터의 상위 0.5% 값, load_resources에서 계산)
+#   주의: 이용률 0.9 이상, 위험: 이용률 1.0 이상
+CAUTION_UTIL, DANGER_UTIL = 0.9, 1.0
+#   LIMITS: 스탠드 -> (주의 하중 MN, 위험 하중 MN). 아래는 초기값이며, 실행할 때 apply_caps()가 데이터에서 다시 채운다.
+_CAP0 = {"F1": 36.43, "F2": 33.68, "F3": 23.62, "F4": 19.45, "F5": 14.31}
+LIMITS = {s: (CAUTION_UTIL * c, DANGER_UTIL * c) for s, c in _CAP0.items()}
+
+
+def apply_caps(res: dict):
+    """데이터에서 계산한 스탠드별 과거 최대 하중으로 경고 기준(LIMITS)을 갱신한다. (스크립트가 다시 실행될 때마다 호출)"""
+    for s, cap in zip(STANDS, res["caps"]):
+        LIMITS[s] = (CAUTION_UTIL * float(cap), DANGER_UTIL * float(cap))
+
+
+def caps_arr() -> np.ndarray:
+    """스탠드별 과거 최대 하중 (이용률 1.0 에 해당하는 하중, MN)."""
+    return np.array([LIMITS[s][1] / DANGER_UTIL for s in STANDS])
+
+
 CONCENTRATION_ALERT_SHARE = 0.30   # 한 스탠드가 전체 하중의 30%를 넘으면 '하중 집중' 경고 (데모용)
 
 # ---- 최적화 설정 (데모 알고리즘) --------------------------------------------------------
@@ -148,6 +163,7 @@ def load_resources() -> dict:
                           float(first["Temperature (K)"].quantile(0.99)) - 273.15),
         "radius_med": d.groupby("Stand ID")["Radius (mm)"].median().loc[STANDS].to_numpy(),
         "cv_med": float(cv_coil.median()),
+        "caps": d.groupby("Stand ID")["force_MN"].quantile(0.995).loc[STANDS].to_numpy(),   # 스탠드별 과거 최대 하중(상위 0.5%)
         "rep": {"grade": str(rep["Grade"].iloc[0]), "width": float(rep["Width (mm)"].iloc[0]),
                 "entry": float(rep["Entry gauge (mm)"].iloc[0]), "final": float(rep["Exit gauge (mm)"].iloc[-1]),
                 "temp_c": float(rep["Temperature (K)"].iloc[0]) - 273.15},
@@ -208,8 +224,8 @@ def optimize_schedule(res, grade, width, entry, final, temps, cur_reds, max_shif
       - 최종 출구 두께 = 목표값 (F5 압하율은 F1~F4로부터 계산되어 항상 일치)
       - 모든 스탠드의 압하율은 과거 관측 범위(1~99%) 안
       - 현재 압하율에서 스탠드당 ±max_shift(%p) 이내 (학습 범위 밖으로 나가는 것을 막음)
-      - 위험 하중 기준을 넘는 후보는 제외
-    목적: 최대 하중 + 0.5 x 스탠드 간 표준편차 를 최소화
+      - 이용률 1.0 이상(과거 최대 하중 이상)이 되는 스탠드가 있는 후보는 제외
+    목적: 최대 이용률 + 0.5 x 스탠드 간 이용률 표준편차 를 최소화 (이용률 = 하중 / 스탠드별 과거 최대 하중)
     방식: 무작위 탐색 후 최적 후보 주변으로 범위를 좁혀 반복 (데모용 탐색 알고리즘, 수학적 최적해 보장 없음)
     """
     rng = np.random.default_rng(seed)
@@ -219,7 +235,7 @@ def optimize_schedule(res, grade, width, entry, final, temps, cur_reds, max_shif
     lo4 = np.minimum(cur_reds[:4], np.maximum(lo[:4], cur_reds[:4] - shift))
     hi4 = np.maximum(cur_reds[:4], np.minimum(hi[:4], cur_reds[:4] + shift))
     lo5, hi5 = min(lo[4], cur_reds[4]), max(hi[4], cur_reds[4])
-    danger = np.array([LIMITS[s][1] for s in STANDS])
+    caps = caps_arr()
 
     def evaluate(r4):
         prod4 = np.prod(1.0 - r4, axis=1)
@@ -227,8 +243,9 @@ def optimize_schedule(res, grade, width, entry, final, temps, cur_reds, max_shif
         reds = np.column_stack([r4, r5])
         ok = (r5 >= lo5) & (r5 <= hi5)
         forces = predict_batch(res, grade, width, entry, exits_from_reductions(entry, reds), temps)
-        over = np.clip(forces - danger, 0, None).sum(axis=1)          # 위험 기준 초과량
-        obj = forces.max(axis=1) + 0.5 * forces.std(axis=1) + 1000.0 * over
+        util = forces / caps                                              # 스탠드별 이용률
+        over = np.clip(util - 0.999 * DANGER_UTIL, 0, None).sum(axis=1)   # 이용률 1.0 이상인 정도
+        obj = util.max(axis=1) + 0.5 * util.std(axis=1) + 1000.0 * over
         obj = np.where(ok, obj, np.inf)
         return reds, forces, obj, over
 
@@ -284,6 +301,7 @@ def build_result(res: dict, inp: dict, reds: np.ndarray, label: str) -> dict:
         "label": label, "reds": np.asarray(reds), "exits": exits, "entries": entries, "drafts": drafts,
         "forces": forces, "shares": shares, "status": status, "in_range": in_range, "temps": temps,
         "contact": np.sqrt(res["radius_med"] * drafts),
+        "util": forces / caps_arr(), "max_util": float(np.max(forces / caps_arr())),
         "total": float(forces.sum()), "max": float(forces.max()), "top": top,
         "mean": float(forces.mean()), "cv": float(forces.std() / forces.mean()),
     }
@@ -293,12 +311,11 @@ def warnings_for(r: dict) -> list[tuple[str, str]]:
     """경고 메시지 목록 [(수준, 메시지)]"""
     msgs = []
     for i, s in enumerate(STANDS):
-        caution, danger = LIMITS[s]
-        f = r["forces"][i]
+        f, u, cap = r["forces"][i], r["util"][i], LIMITS[s][1]
         if r["status"][i] == "danger":
-            msgs.append(("danger", f"{s} 예측 하중 {f:.1f} MN — 위험 기준 {danger:.1f} MN 초과 (+{(f / danger - 1) * 100:.1f}%)"))
+            msgs.append(("danger", f"{s} 예측 하중 {f:.1f} MN (이용률 {u:.2f}) — 과거 최대 하중 {cap:.1f} MN 이상입니다"))
         elif r["status"][i] == "warn":
-            msgs.append(("warn", f"{s} 예측 하중 {f:.1f} MN — 주의 기준 {caution:.1f} MN 초과"))
+            msgs.append(("warn", f"{s} 예측 하중 {f:.1f} MN (이용률 {u:.2f}) — 이용률 {CAUTION_UTIL:.1f} 이상으로 과거 최대 하중에 가깝습니다"))
     t = r["top"]
     if r["shares"][t] >= CONCENTRATION_ALERT_SHARE:
         msgs.append(("warn", f"하중 집중: {STANDS[t]} 스탠드가 전체 하중의 {r['shares'][t] * 100:.1f}%를 차지합니다 "
@@ -358,7 +375,7 @@ def analyze_process(res: dict, inp: dict, cur: dict, opt: dict | None, opt_meta:
     probs = []
     n_d, n_w = cur["status"].count("danger"), cur["status"].count("warn")
     if n_d or n_w:
-        probs.append(f"위험 {n_d}개, 주의 {n_w}개 스탠드가 있습니다 (데모용 가상 기준)")
+        probs.append(f"위험 {n_d}개, 주의 {n_w}개 스탠드가 있습니다 (이용률 기준)")
     top2 = cur["forces"][order[:2]].sum() / cur["total"] * 100
     probs.append(f"상위 2개 스탠드({STANDS[int(order[0])]}, {STANDS[int(order[1])]})가 전체 하중의 {top2:.0f}%를 담당합니다")
     if cur["cv"] > res["cv_med"] * 1.1:
@@ -392,16 +409,22 @@ def analyze_process(res: dict, inp: dict, cur: dict, opt: dict | None, opt_meta:
         out.append(("⑤ 최적화 후 변화", "아직 최적화를 실행하지 않았습니다."))
     else:
         dm = (opt["max"] / cur["max"] - 1) * 100
+        du = (opt["max_util"] / cur["max_util"] - 1) * 100
         dcv = (opt["cv"] / cur["cv"] - 1) * 100
-        lines = [f"최대 하중 **{cur['max']:.1f} → {opt['max']:.1f} MN ({dm:+.1f}%)**",
-                 f"하중 편차(CV) **{cur['cv']:.2f} → {opt['cv']:.2f} ({dcv:+.1f}%)**",
-                 f"{STANDS[opt['top']]}가 가장 높은 스탠드이며 비율은 {cur['shares'][t] * 100:.1f}% → {opt['shares'][opt['top']] * 100:.1f}%"]
+        ucur, uopt = int(np.argmax(cur["util"])), int(np.argmax(opt["util"]))
+        lines = [f"최대 이용률 **{cur['max_util']:.2f} → {opt['max_util']:.2f} ({du:+.1f}%)** "
+                 f"(이용률이 가장 높은 스탠드: {STANDS[ucur]} → {STANDS[uopt]})",
+                 f"최대 하중 **{cur['max']:.1f} → {opt['max']:.1f} MN ({dm:+.1f}%)**",
+                 f"하중 편차(CV) **{cur['cv']:.2f} → {opt['cv']:.2f} ({dcv:+.1f}%)**"]
         changed = [f"{s} {STATUS[a][0]}→{STATUS[b][0]}" for s, a, b in zip(STANDS, cur["status"], opt["status"]) if a != b]
         lines.append("경고 상태 변화: " + (", ".join(changed) if changed else "변화 없음"))
         if opt_meta and not opt_meta["feasible"]:
-            lines.append("⚠ 위험 기준을 모두 만족하는 배분을 찾지 못했습니다. 입력 조건 자체를 조정해야 할 수 있습니다.")
-        if dm > 0:
-            lines.append("⚠ 최대 하중이 늘었습니다. 이 모델과 제약조건에서는 현재 배분이 더 낫습니다.")
+            lines.append("⚠ 이용률 1.0 미만을 모두 만족하는 배분을 찾지 못했습니다. 입력 조건 자체를 조정해야 할 수 있습니다.")
+        if du > 0:
+            lines.append("⚠ 최대 이용률이 늘었습니다. 이 모델과 제약조건에서는 현재 배분이 더 낫습니다.")
+        elif dm > 0:
+            lines.append("ℹ 최대 이용률은 줄었지만 최대 하중(MN)은 늘었습니다. 하중을 이용률 여유가 큰 스탠드로 옮겼기 때문이며, "
+                         "이용률과 MN을 함께 봐야 합니다.")
         out.append(("⑤ 최적화 후 변화", "- " + "\n- ".join(lines)))
     return out
 
@@ -434,13 +457,13 @@ def fig_load_compare(cur: dict, opt: dict | None) -> go.Figure:
     if opt is not None:
         fig.add_bar(x=STANDS, y=opt["forces"], name="최적화 후", marker_color=C_ACCENT,
                     text=[f"{v:.1f}" for v in opt["forces"]], textposition="outside")
-    caution, danger = LIMITS["F1"][0], LIMITS["F1"][1]
-    fig.add_hline(y=danger, line=dict(color=C_DANGER, dash="dash"), annotation_text=f"위험 {danger:.0f} MN (가상)",
-                  annotation_font_color=C_DANGER, annotation_position="top right")
-    fig.add_hline(y=caution, line=dict(color=C_WARN, dash="dot"), annotation_text=f"주의 {caution:.0f} MN (가상)",
-                  annotation_font_color=C_WARN, annotation_position="bottom right")
-    plotly_dark(fig, 340, "스탠드별 압연 하중 (MN)")
-    fig.update_layout(barmode="group", yaxis_range=[0, max(danger, cur["max"], opt["max"] if opt else 0) * 1.2])
+    caps = caps_arr()
+    fig.add_scatter(x=STANDS, y=caps, mode="lines+markers", name="이용률 1.0 (과거 최대 하중)",
+                    line=dict(color=C_DANGER, dash="dash", width=1.5), marker=dict(symbol="line-ew-open", size=18))
+    fig.add_scatter(x=STANDS, y=CAUTION_UTIL * caps, mode="lines", name=f"이용률 {CAUTION_UTIL:.1f}",
+                    line=dict(color=C_WARN, dash="dot", width=1.2))
+    plotly_dark(fig, 340, "스탠드별 압연 하중 (MN) · 점선 = 스탠드별 과거 최대 하중 기준")
+    fig.update_layout(barmode="group", yaxis_range=[0, max(caps.max(), cur["max"], opt["max"] if opt else 0) * 1.2])
     return fig
 
 
@@ -477,12 +500,12 @@ TWIN_DIR = Path(__file__).resolve().parent / "twin"
 
 
 def bottleneck_info(r: dict) -> dict:
-    """병목 후보 스탠드: 위험 기준 대비 하중이 가장 높은 스탠드."""
-    ratio = np.array([r["forces"][i] / LIMITS[s][1] for i, s in enumerate(STANDS)])
+    """병목 후보 스탠드: 이용률이 가장 높은 스탠드."""
+    ratio = np.asarray(r["util"])
     i = int(np.argmax(ratio))
-    level = "danger" if ratio[i] >= 1.0 else ("warn" if ratio[i] >= 0.9 else "info")
+    level = "danger" if ratio[i] >= DANGER_UTIL else ("warn" if ratio[i] >= CAUTION_UTIL else "info")
     return {"stand": STANDS[i], "level": level,
-            "text": f"위험 기준(가상) 대비 {ratio[i] * 100:.0f}%, 전체 하중의 {r['shares'][i] * 100:.0f}%"}
+            "text": f"이용률 {ratio[i]:.2f} ({r['forces'][i]:.1f} MN, 1.0 = 과거 최대 하중), 전체 하중의 {r['shares'][i] * 100:.0f}%"}
 
 
 def energy_estimate(cur: dict, opt: dict | None) -> dict | None:
@@ -509,7 +532,7 @@ def build_twin_html(res: dict, inp: dict, cur: dict, opt: dict | None) -> str:
         "forces": [float(v) for v in cur["forces"]], "status": list(cur["status"]),
         "reds": [float(v) * 100 for v in cur["reds"]], "drafts": [float(v) for v in cur["drafts"]],
         "temps_c": [float(v) - 273.15 for v in cur["temps"]],
-        "limits": [list(LIMITS[s]) for s in STANDS],
+        "limits": [list(LIMITS[s]) for s in STANDS], "caps": [float(c) for c in caps_arr()],
         "opt": None if opt is None else {
             "forces": [float(v) for v in opt["forces"]], "reds": [float(v) * 100 for v in opt["reds"]],
             "drafts": [float(v) for v in opt["drafts"]], "status": list(opt["status"])},
@@ -538,11 +561,12 @@ def stand_card(i: int, cur: dict, opt: dict | None) -> str:
     html = (f"<div class='sc' style='border-left:4px solid {color}'><div class='sc-h'><b>{s}</b>"
             f"<span class='badge' style='background:{color}22;color:{color};border:1px solid {color}'>{name}</span></div>"
             f"<div class='sc-v'>{cur['forces'][i]:.1f}<span class='kpi-u'>MN</span></div>"
+            f"<div class='sc-o' style='margin:-4px 0 4px 0'>이용률 <b style='color:{color}'>{cur['util'][i]:.2f}</b></div>"
             f"<div class='bar'><div style='width:{pct:.0f}%;background:{color}'></div></div>")
     if opt is not None:
         n2, c2 = STATUS[opt["status"][i]]
         d = (opt["forces"][i] / cur["forces"][i] - 1) * 100
-        html += (f"<div class='sc-o'>→ {opt['forces'][i]:.1f} MN ({d:+.1f}%)<br>"
+        html += (f"<div class='sc-o'>→ {opt['forces'][i]:.1f} MN · 이용률 {opt['util'][i]:.2f}<br>({d:+.1f}%) "
                  f"<span style='color:{c2}'>● {n2}</span></div>")
     return html + "</div>"
 
@@ -553,15 +577,15 @@ def fig_mini(cur: dict, opt: dict | None) -> go.Figure:
     fig.add_scatter(x=STANDS, y=cur["forces"], mode="lines+markers", name="현재", line=dict(color=C_STEEL, width=2))
     if opt is not None:
         fig.add_scatter(x=STANDS, y=opt["forces"], mode="lines+markers", name="최적화 후", line=dict(color=C_ACCENT, width=2))
-    fig.add_hline(y=LIMITS["F1"][1], line=dict(color=C_DANGER, dash="dash", width=1))
+    fig.add_scatter(x=STANDS, y=caps_arr(), mode="lines", name="이용률 1.0", line=dict(color=C_DANGER, dash="dash", width=1))
     plotly_dark(fig, 190)
     fig.update_layout(title=dict(text=""), margin=dict(l=30, r=8, t=24, b=24), legend=dict(orientation="h", y=1.25, x=0, font=dict(size=10)),
-                      yaxis_range=[0, max(LIMITS["F1"][1], cur["max"], opt["max"] if opt else 0) * 1.15], paper_bgcolor="#121216", plot_bgcolor="#121216")
+                      yaxis_range=[0, max(caps_arr().max(), cur["max"], opt["max"] if opt else 0) * 1.15], paper_bgcolor="#121216", plot_bgcolor="#121216")
     return fig
 
 
 def sidebar_summary(cur: dict, opt: dict | None):
-    """왼쪽 패널 아래쪽: 핵심 숫자 2개와 작은 곡선 그래프."""
+    """왼쪽 패널 아래쪽: 핵심 숫자 3개와 작은 곡선 그래프."""
     def big(title, v, unit, v2, fmt):
         arrow = ""
         if v2 is not None:
@@ -571,6 +595,7 @@ def sidebar_summary(cur: dict, opt: dict | None):
     with st.sidebar:
         st.markdown("<hr class='sb-hr'>", unsafe_allow_html=True)
         st.markdown(big("최대 압연 하중", cur["max"], "MN", opt["max"] if opt else None, "{:.1f}")
+                    + big("최대 이용률", cur["max_util"], "", opt["max_util"] if opt else None, "{:.2f}")
                     + big("하중 편차 (CV)", cur["cv"], "", opt["cv"] if opt else None, "{:.2f}"), unsafe_allow_html=True)
         st.markdown("<div class='sb-kt' style='margin-top:10px'>압연 하중 곡선 (F1→F5)</div>", unsafe_allow_html=True)
         st.plotly_chart(fig_mini(cur, opt), width="stretch", config={"displayModeBar": False})
@@ -658,6 +683,7 @@ def apply_preset(name: str, res: dict):
         eps = w * rest
         reds = np.concatenate([[r1], 1 - np.exp(-eps)])
         ss["in_manual"] = True
+        ss["in_width"] = int(min(res["width_range"][1], round(rep["width"]) + 170))   # 폭이 넓은 코일: F1 이용률이 0.9를 넘도록
         for i in range(4):
             ss[f"in_r{i + 1}"] = float(round(np.clip(reds[i], res["red_lo"][i], res["red_hi"][i]) * 100, 1))
     ss["cur"] = ss["opt"] = ss["opt_meta"] = None   # 이전 결과는 지우고 새로 계산
@@ -725,12 +751,13 @@ def main():
     if "error" in res:
         st.error(res["error"])
         st.stop()
+    apply_caps(res)                  # 경고 기준(이용률)을 데이터에서 계산한 값으로 갱신
     init_state(res)
     ss = st.session_state
 
     # ---- 헤더
     model_tag = f"<span class='tag'>예측 모델: {MODEL_NAME}</span>" if MODEL_IS_PLACEHOLDER else "<span class='tag live'>학습 모델</span>"
-    limit_tag = "<span class='tag'>설비 기준: 데모용 가상값</span>" if LIMITS_ARE_DEMO else ""
+    limit_tag = "<span class='tag'>경고 기준: 과거 최대 하중 대비 이용률</span>"
     st.markdown(f"<div class='topbar'><span class='tb-title'>HOT FINISHING MILL · F1~F5 DIGITAL TWIN</span>"
                 f"<div>{model_tag}{limit_tag}<span class='tag'>최적화: 제약 기반 탐색(데모)</span></div></div>",
                 unsafe_allow_html=True)
@@ -778,7 +805,7 @@ def main():
     k[0].markdown(kpi_card("전체 압연 하중 (ΣF1~F5)", f"{cur['total']:.1f}", "MN", f"스탠드 {len(STANDS)}개 합계", C_STEEL,
                            after(opt["total"]) if opt else None), unsafe_allow_html=True)
     base = cur["max"]
-    k[1].markdown(kpi_card("최대 압연 하중", f"{cur['max']:.1f}", "MN", f"{STANDS[t]} · {STATUS[cur['status'][t]][0]}",
+    k[1].markdown(kpi_card("최대 압연 하중", f"{cur['max']:.1f}", "MN", f"{STANDS[t]} · 이용률 {cur['util'][t]:.2f} · {STATUS[cur['status'][t]][0]}",
                            STATUS[cur["status"][t]][1], after(opt["max"]) if opt else None), unsafe_allow_html=True)
     k[2].markdown(kpi_card("하중 집중 스탠드", STANDS[t], "", f"전체의 {cur['shares'][t] * 100:.1f}% (균등 20%)", C_ACCENT,
                            f"{STANDS[opt['top']]} · {opt['shares'][opt['top']] * 100:.1f}%" if opt else None), unsafe_allow_html=True)
@@ -799,7 +826,7 @@ def main():
         components.html(twin_html, height=1250)
     ss["anim"] = None
     st.caption("3D 장면의 소재 이동, 온도, 속도는 시뮬레이션 값이며 실측 데이터가 아닙니다. "
-               "F1~F5 하중과 압하 배분은 AI 예측(임시 모델) 값이고, 설비 기준은 데모용 가상값입니다.")
+               "F1~F5 하중과 압하 배분은 AI 예측(임시 모델) 값이고, 이용률은 과거 최대 하중 대비 값(실제 설비 정격 아님)입니다.")
 
     # ---- 경고 + AI Agent
     left, right = st.columns([5, 4])
@@ -820,9 +847,9 @@ def main():
             st.markdown(f"<div class='alert info'>최적화 후 경고: 위험 {before['danger']}→{afterc['danger']}개, "
                         f"주의 {before['warn']}→{afterc['warn']}개 · 탐색 후보 {opt_meta['n_evaluated']:,}개 평가</div>",
                         unsafe_allow_html=True)
-        if LIMITS_ARE_DEMO:
-            st.markdown(f"<div class='note'>※ 설비 기준은 실제 허용 하중이 아닌 데모용 가상값입니다 (주의 {LIMITS['F1'][0]:.0f} / 위험 {LIMITS['F1'][1]:.0f} MN). "
-                        "코드의 LIMITS 표에서 실제 값으로 교체합니다.</div>", unsafe_allow_html=True)
+        caps_txt = " / ".join(f"{s} {c:.1f}" for s, c in zip(STANDS, caps_arr()))
+        st.markdown(f"<div class='note'>※ 이용률 = 예측 하중 ÷ 스탠드별 과거 최대 하중(데이터 상위 0.5%). 주의 {CAUTION_UTIL:.1f} 이상, 위험 {DANGER_UTIL:.1f} 이상. "
+                    f"과거 최대 하중(MN): {caps_txt}. 실제 설비 정격이 아니므로 하중(MN)과 이용률을 함께 보세요.</div>", unsafe_allow_html=True)
     with right:
         st.markdown("<div class='panel-t'>AI 공정 분석 <span>AGENT</span></div>", unsafe_allow_html=True)
         ctx = dict(res=res, inp=inp, cur=cur, opt=opt, opt_meta=opt_meta)
@@ -859,7 +886,7 @@ def main():
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     if opt_meta is not None:
         st.markdown(f"<div class='note'>최적화: 총 두께 감소량 유지, 압하율은 과거 관측 범위(1~99%) 안, 현재 대비 ±{opt_meta['max_shift']:.0f}%p 이내, "
-                    "위험 기준 초과 후보 제외. 무작위 탐색을 좁혀 가는 <b>데모용 알고리즘</b>이며 수학적 최적해를 보장하지 않습니다.</div>",
+                    "이용률 1.0 이상 후보 제외. 무작위 탐색을 좁혀 가는 <b>데모용 알고리즘</b>이며 수학적 최적해를 보장하지 않습니다.</div>",
                     unsafe_allow_html=True)
 
 
