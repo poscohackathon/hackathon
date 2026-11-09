@@ -54,7 +54,7 @@
   .card{padding:10px 12px;font-size:12px;min-width:0}
   .card h5{margin:0 0 6px 0;font-size:12px;color:var(--text);display:flex;justify-content:space-between}
   .card h5 span{font-weight:400;color:var(--muted);font-size:10px}
-  .lrow{display:grid;grid-template-columns:24px 1fr 148px;gap:6px;align-items:center;padding:2px 0}
+  .lrow{display:grid;grid-template-columns:24px 1fr 152px;gap:6px;align-items:center;padding:2px 0}
   .lbar{height:7px;background:#2a2522;border-radius:4px;position:relative;overflow:hidden}
   .lbar div{position:absolute;left:0;top:0;bottom:0;border-radius:4px}
   .lbar .o{opacity:.0}
@@ -524,9 +524,9 @@ $('f_grade').textContent = D.grade;
 })();
 (function buildAI() {
   const o = D.opt, lim = (i) => D.caps[i];
-  let h = '<div class="card panel"><h5>AI 예측 하중 <span>' + (o ? '현재 → 최적화 후' : '현재') + ' · 하중 MN · 이용률</span></h5>';
+  let h = '<div class="card panel"><h5>AI 예측 하중 <span>' + (o ? '현재 → 최적화 후' : '현재') + ' · 하중 MN · 이용률' + (D.actual ? ' · 실측 포함' : '') + '</span></h5>';
   D.forces.forEach((f, i) => { const w1 = Math.min(100, f / lim(i) * 100), w2 = o ? Math.min(100, o.forces[i] / lim(i) * 100) : 0;
-    h += `<div class="lrow"><b>F${i + 1}</b><div class="lbar"><div style="width:${w1}%;background:${STATUS_COL[D.status[i]]};opacity:${o ? 0.4 : 1}"></div>${o ? `<div style="width:${w2}%;background:__ACCENT__;height:3px;top:2px;bottom:auto"></div>` : ''}</div><span class="cmp">${f.toFixed(1)} · ${(f / lim(i)).toFixed(2)}${o ? ` → <b style="color:${o.forces[i] <= f ? '#7fe0a0' : '#ffb0a8'}">${o.forces[i].toFixed(1)} · ${(o.forces[i] / lim(i)).toFixed(2)}</b>` : ''}</span></div>`; });
+    h += `<div class="lrow"><b>F${i + 1}</b><div class="lbar"><div style="width:${w1}%;background:${STATUS_COL[D.status[i]]};opacity:${o ? 0.4 : 1}"></div>${o ? `<div style="width:${w2}%;background:__ACCENT__;height:3px;top:2px;bottom:auto"></div>` : ''}</div><span class="cmp">${f.toFixed(1)} · ${(f / lim(i)).toFixed(2)}${o ? ` → <b style="color:${o.forces[i] <= f ? '#7fe0a0' : '#ffb0a8'}">${o.forces[i].toFixed(1)} · ${(o.forces[i] / lim(i)).toFixed(2)}</b>` : ''}${D.actual ? `<br><span class="muted">실측 ${D.actual[i].toFixed(1)} · ${(D.actual[i] / lim(i)).toFixed(2)}</span>` : ''}</span></div>`; });
   h += `<div class="muted" style="margin-top:4px">MN · 이용률 (이용률 1.0 = 스탠드별 과거 최대 하중 ${D.caps.map((c) => c.toFixed(1)).join(' / ')} MN, 실제 설비 정격 아님)</div></div>`;
   h += '<div class="card panel"><h5>최적 압하 배분 <span>압하율 %</span></h5>';
   if (o) { h += '<table class="rt"><tr><th>스탠드</th><th>현재</th><th>추천</th><th>변화</th></tr>'; D.reds.forEach((r, i) => { const d = o.reds[i] - r; h += `<tr><td>F${i + 1}</td><td>${r.toFixed(1)}</td><td><b>${o.reds[i].toFixed(1)}</b></td><td style="color:${d < 0 ? '#7fb8ff' : '#ffb36b'}">${d >= 0 ? '+' : ''}${d.toFixed(1)}%p</td></tr>`; }); h += '</table><div class="muted" style="margin-top:4px">최종 두께 유지 · 관측 범위 안 · 데모 탐색 알고리즘</div>'; }

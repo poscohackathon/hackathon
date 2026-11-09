@@ -61,6 +61,10 @@ def caps_arr() -> np.ndarray:
 
 CONCENTRATION_ALERT_SHARE = 0.30   # 한 스탠드가 전체 하중의 30%를 넘으면 '하중 집중' 경고 (데모용)
 
+# ---- 샘플 코일 (김하진 인계 문서의 시연 코일. 데이터에서 실제 조건과 실측 하중을 불러온다) --------
+SAMPLE_COILS = {2744: "메인 시연 · F1 병목", 2599: "보조 시연 · F1 한계 직전", 2086: "후보 · Grade01",
+                6175: "후보 · Grade06", 6920: "후보 · Grade08"}
+
 # ---- 최적화 설정 (데모 알고리즘) --------------------------------------------------------
 MAX_SHIFT_DEFAULT = 8.0            # 현재 압하율에서 스탠드당 최대 조정폭 (%p). 학습 범위 밖 외삽을 막기 위함
 N_SAMPLES = 25000                  # 라운드당 탐색 후보 수
@@ -149,18 +153,38 @@ def load_resources() -> dict:
     temp_med = d.groupby("Stand ID")["Temperature (K)"].median().loc[STANDS].to_numpy()
     cv_coil = d.groupby("Coil ID")["force_MN"].agg(lambda x: x.std(ddof=0) / x.mean())
 
+    # 입력 슬라이더 범위: 데이터의 최소~최대 (과거 운영 범위 1~99%는 red_lo/red_hi로 따로 두고 신뢰도 판정에 쓴다)
+    fl, ce = (lambda x, k: math.floor(x * k) / k), (lambda x, k: math.ceil(x * k) / k)
+    red_min = d.groupby("Stand ID")["reduction"].min().loc[STANDS].to_numpy()
+    red_max = d.groupby("Stand ID")["reduction"].max().loc[STANDS].to_numpy()
+
+    # 샘플 코일: 정리된 데이터는 코일마다 F1~F5 5행이고 (코일, 스탠드) 순으로 정렬돼 있다
+    n5 = len(d) // 5
+    col5 = lambda name: d[name].to_numpy().reshape(n5, 5)
+    ids5, pos = col5("Coil ID")[:, 0], {}
+    pos = {int(c): i for i, c in enumerate(ids5)}
+    f5, red5, ent5, ex5 = col5("force_MN"), col5("reduction"), col5("Entry gauge (mm)"), col5("Exit gauge (mm)")
+    wid5, tmp5, gr5, ca5 = col5("Width (mm)"), col5("Temperature (K)"), col5("Grade"), col5("Caster ID")
+    coils = {}
+    for cid in SAMPLE_COILS:
+        if cid in pos:
+            k = pos[cid]
+            coils[cid] = {"grade": str(gr5[k, 0]), "caster": str(ca5[k, 0]), "width": float(wid5[k, 0]),
+                          "entry": float(ent5[k, 0]), "final": float(ex5[k, 4]), "temp_c": float(tmp5[k, 0]) - 273.15,
+                          "reds": red5[k].astype(float), "forces": f5[k].astype(float)}
+
     return {
+        "coils": coils, "red_min": np.floor(red_min * 200) / 200, "red_max": np.ceil(red_max * 200) / 200,
         "model": model, "grades": grades, "n_grades": len(grades),
         "grade_counts": d.groupby("Grade")["Coil ID"].nunique().to_dict(),
         "red_lo": q[0.01].to_numpy(), "red_med": q[0.5].to_numpy(), "red_hi": q[0.99].to_numpy(),
         "strain_share": share,
-        "entry_range": (float(first["Entry gauge (mm)"].quantile(0.01)), float(first["Entry gauge (mm)"].quantile(0.99))),
-        "final_range": (float(last["Exit gauge (mm)"].quantile(0.01)), float(last["Exit gauge (mm)"].quantile(0.99))),
-        "width_range": (float(d["Width (mm)"].quantile(0.01)), float(d["Width (mm)"].quantile(0.99))),
+        "entry_range": (fl(first["Entry gauge (mm)"].min(), 10), ce(first["Entry gauge (mm)"].max(), 10)),
+        "final_range": (fl(last["Exit gauge (mm)"].min(), 20), ce(last["Exit gauge (mm)"].max(), 20)),
+        "width_range": (math.floor(d["Width (mm)"].min()), math.ceil(d["Width (mm)"].max())),
         "width_med": float(d["Width (mm)"].median()),
         "temp_med": temp_med,                                   # 스탠드별 중앙값 (K)
-        "temp1_range_c": (float(first["Temperature (K)"].quantile(0.01)) - 273.15,
-                          float(first["Temperature (K)"].quantile(0.99)) - 273.15),
+        "temp1_range_c": (math.floor(first["Temperature (K)"].min() - 273.15), math.ceil(first["Temperature (K)"].max() - 273.15)),
         "radius_med": d.groupby("Stand ID")["Radius (mm)"].median().loc[STANDS].to_numpy(),
         "cv_med": float(cv_coil.median()),
         "caps": d.groupby("Stand ID")["force_MN"].quantile(0.995).loc[STANDS].to_numpy(),   # 스탠드별 과거 최대 하중(상위 0.5%)
@@ -517,7 +541,7 @@ def energy_estimate(cur: dict, opt: dict | None) -> dict | None:
     return {"delta_pct": (w_opt / w_cur - 1.0) * 100.0}
 
 
-def build_twin_html(res: dict, inp: dict, cur: dict, opt: dict | None) -> str:
+def build_twin_html(res: dict, inp: dict, cur: dict, opt: dict | None, actual=None, sample_id=None) -> str:
     """3D 디지털 트윈 화면(HTML)을 만든다.
 
     - 장면(애니메이션)은 twin/scene.html 이 브라우저 안에서 실행한다. Streamlit이 다시 그리지 않으므로 끊기지 않는다.
@@ -528,6 +552,7 @@ def build_twin_html(res: dict, inp: dict, cur: dict, opt: dict | None) -> str:
     three = (TWIN_DIR / "three.min.js").read_text(encoding="utf-8")
     data = {
         "label": cur["label"], "grade": inp["grade"], "width": inp["width"],
+        "actual": None if actual is None else [float(v) for v in actual], "sample_id": sample_id,
         "entries": [float(v) for v in cur["entries"]], "exits": [float(v) for v in cur["exits"]],
         "forces": [float(v) for v in cur["forces"]], "status": list(cur["status"]),
         "reds": [float(v) * 100 for v in cur["reds"]], "drafts": [float(v) for v in cur["drafts"]],
@@ -582,6 +607,29 @@ def fig_mini(cur: dict, opt: dict | None) -> go.Figure:
     fig.update_layout(title=dict(text=""), margin=dict(l=30, r=8, t=24, b=24), legend=dict(orientation="h", y=1.25, x=0, font=dict(size=10)),
                       yaxis_range=[0, max(caps_arr().max(), cur["max"], opt["max"] if opt else 0) * 1.15], paper_bgcolor="#121216", plot_bgcolor="#121216")
     return fig
+
+
+def render_actual_compare(cur: dict, actual: np.ndarray, smp: dict):
+    """샘플 코일의 실측 하중과 모델 예측을 나란히 보여 준다."""
+    err = cur["forces"] - actual
+    caps = caps_arr()
+    st.markdown(f"<div class='panel-t'>샘플 코일 실측 비교 <span>ACTUAL VS PREDICTED</span> · 코일 {smp['id']} · 연주기 {smp['caster']}</div>",
+                unsafe_allow_html=True)
+    c1, c2 = st.columns([3, 2])
+    fig = go.Figure()
+    fig.add_bar(x=STANDS, y=actual, name="실측", marker_color="#cfcfd6", text=[f"{v:.1f}" for v in actual], textposition="outside")
+    fig.add_bar(x=STANDS, y=cur["forces"], name="예측 (임시 모델)", marker_color=C_STEEL,
+                text=[f"{v:.1f}" for v in cur["forces"]], textposition="outside")
+    plotly_dark(fig, 300, "스탠드별 하중 (MN)")
+    fig.update_layout(barmode="group", yaxis_range=[0, max(actual.max(), cur["max"]) * 1.25])
+    c1.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    with c2:
+        st.dataframe(pd.DataFrame({"스탠드": STANDS, "실측 (MN)": np.round(actual, 1), "예측 (MN)": np.round(cur["forces"], 1),
+                                   "오차 (MN)": np.round(err, 1), "실측 이용률": np.round(actual / caps, 2),
+                                   "예측 이용률": np.round(cur["util"], 2)}), hide_index=True, width="stretch")
+        st.markdown(f"<div class='note'>평균 절대 오차(MAE) <b>{np.abs(err).mean():.2f} MN</b> · 최대 오차 {np.abs(err).max():.2f} MN<br>"
+                    f"최대 이용률: 실측 <b>{(actual / caps).max():.2f}</b> / 예측 <b>{cur['max_util']:.2f}</b><br>"
+                    "현재는 임시 모델(선형 회귀)이라 오차가 큽니다. 최종 모델을 연결하면 갱신됩니다.</div>", unsafe_allow_html=True)
 
 
 def sidebar_summary(cur: dict, opt: dict | None):
@@ -656,7 +704,7 @@ def init_state(res: dict):
     rep = res["rep"]
     defaults = {"in_grade": rep["grade"], "in_width": int(round(rep["width"])), "in_entry": round(rep["entry"], 1),
                 "in_final": round(rep["final"], 2), "in_temp": int(round(rep["temp_c"])), "in_manual": False,
-                "in_shift": MAX_SHIFT_DEFAULT, "cur": None, "opt": None, "opt_meta": None,
+                "in_shift": MAX_SHIFT_DEFAULT, "in_sample": 0, "sample": None, "cur": None, "opt": None, "opt_meta": None,
                 "anim": None, "agent_new": False}
     reds = default_reductions(res, rep["entry"], rep["final"])
     for i in range(4):
@@ -688,6 +736,37 @@ def apply_preset(name: str, res: dict):
             ss[f"in_r{i + 1}"] = float(round(np.clip(reds[i], res["red_lo"][i], res["red_hi"][i]) * 100, 1))
     ss["cur"] = ss["opt"] = ss["opt_meta"] = None   # 이전 결과는 지우고 새로 계산
     ss["anim"] = None
+    ss["in_sample"], ss["sample"] = 0, None         # 프리셋을 쓰면 샘플 코일 선택은 해제한다
+
+
+def load_sample(res: dict):
+    """샘플 코일 선택 콜백: 실제 코일의 조건과 압하 배분(F1~F4)을 입력칸에 채우고, 실측 하중을 기억해 둔다."""
+    ss = st.session_state
+    cid = ss["in_sample"]
+    ss["cur"] = ss["opt"] = ss["opt_meta"] = None
+    ss["anim"] = None
+    if not cid:
+        ss["sample"] = None
+        return
+    c = res["coils"][cid]
+    ss.update(in_grade=c["grade"], in_width=int(round(c["width"])), in_entry=round(c["entry"], 2),
+              in_final=round(c["final"], 2), in_temp=int(round(c["temp_c"])), in_manual=True)
+    reds4 = [round(float(c["reds"][i]) * 100, 2) for i in range(4)]
+    for i in range(4):
+        ss[f"in_r{i + 1}"] = reds4[i]
+    ss["sample"] = {"id": cid, "caster": c["caster"], "actual": [float(v) for v in c["forces"]],
+                    "inputs": dict(grade=c["grade"], width=float(ss["in_width"]), entry=ss["in_entry"], final=ss["in_final"],
+                                   temp_c=float(ss["in_temp"]), reds4=[v / 100 for v in reds4])}
+
+
+def sample_matches(inp: dict, smp: dict | None) -> bool:
+    """현재 입력이 불러온 샘플 코일 조건과 같은지 (같을 때만 실측과 비교할 수 있다)."""
+    if not smp or not inp["manual"]:
+        return False
+    i = smp["inputs"]
+    return bool(inp["grade"] == i["grade"] and abs(inp["width"] - i["width"]) < 0.5 and abs(inp["entry"] - i["entry"]) < 0.005
+                and abs(inp["final"] - i["final"]) < 0.005 and abs(inp["temp_c"] - i["temp_c"]) < 0.5
+                and np.allclose(inp["reds_in"], i["reds4"], atol=1e-4))
 
 
 def sidebar_inputs(res: dict) -> dict:
@@ -699,6 +778,13 @@ def sidebar_inputs(res: dict) -> dict:
         c1, c2 = st.columns(2)
         c1.button("표준 조건", on_click=apply_preset, args=("표준", res), width="stretch")
         c2.button("F1 집중", on_click=apply_preset, args=("F1", res), width="stretch")
+        st.selectbox("샘플 코일 불러오기", [0] + list(SAMPLE_COILS), key="in_sample", on_change=load_sample, args=(res,),
+                     format_func=lambda c: "(직접 입력)" if not c else f"코일 {c} · {SAMPLE_COILS[c]}",
+                     help="실제 조업 코일의 조건과 압하 배분을 불러옵니다. 불러온 조건을 바꾸지 않으면 실측 하중과 예측을 비교해 보여 줍니다.")
+        if ss.get("sample"):
+            st.caption(f"연주기 {ss['sample']['caster']} · 현재 임시 모델은 연주기를 입력으로 쓰지 않습니다.")
+            st.button("↺ 이 코일 조건으로 되돌리기", on_click=load_sample, args=(res,), width="stretch",
+                      help="슬라이더를 바꾼 뒤 불러온 코일의 원래 조건으로 되돌립니다.")
 
         grade = st.selectbox("강종", res["grades"], key="in_grade",
                              format_func=lambda g: f"{g}  (코일 {res['grade_counts'][g]}개)")
@@ -716,8 +802,8 @@ def sidebar_inputs(res: dict) -> dict:
         reds_in = None
         if manual:
             st.caption("F1~F4를 정하면 F5는 목표 두께에 맞춰 자동 계산됩니다.")
-            reds_in = [st.slider(f"{STANDS[i]} 압하율 (%)", round(res["red_lo"][i] * 100, 1),
-                                 round(res["red_hi"][i] * 100, 1), step=0.5, key=f"in_r{i + 1}") / 100 for i in range(4)]
+            reds_in = [st.slider(f"{STANDS[i]} 압하율 (%)", round(res["red_min"][i] * 100, 1),
+                                 round(res["red_max"][i] * 100, 1), step=0.5, key=f"in_r{i + 1}") / 100 for i in range(4)]
         with st.expander("최적화 설정"):
             shift = st.slider("스탠드당 최대 조정폭 (%p)", 2.0, 15.0, step=1.0, key="in_shift",
                               help="현재 압하율에서 이만큼까지만 바꿉니다. 작을수록 과거 운영 방식에 가까운 안전한 추천이 됩니다.")
@@ -786,6 +872,8 @@ def main():
         ss["anim"], ss["agent_new"] = "opt", True
 
     cur, opt, opt_meta = ss["cur"], ss["opt"], ss["opt_meta"]
+    smp = ss.get("sample")
+    actual = np.array(smp["actual"]) if (smp and cur["sig"] == sig and sample_matches(inp, smp)) else None   # 불러온 조건 그대로일 때만 실측 비교
     if cur["sig"] != sig:
         st.markdown("<div class='alert info'>입력값이 바뀌었습니다. 아래 결과는 이전 조건 기준입니다. "
                     "<b>시뮬레이션 실행</b>을 눌러 갱신하세요.</div>", unsafe_allow_html=True)
@@ -819,7 +907,7 @@ def main():
     # ---- 3D 디지털 트윈 (애니메이션은 브라우저 안에서 계속 실행되며, 이 화면은 다시 그려지지 않는다)
     st.markdown(f"<div class='panel-t'>제철소 디지털 트윈 <span>3D LIVE SIMULATION</span> · {cur['label']} 조건"
                 f"{' · 최적화 후 비교 포함' if opt is not None else ''}</div>", unsafe_allow_html=True)
-    twin_html = build_twin_html(res, inp, cur, opt)         # 우리가 만든 HTML만 삽입한다
+    twin_html = build_twin_html(res, inp, cur, opt, actual, smp["id"] if actual is not None else None)   # 우리가 만든 HTML만 삽입한다
     if hasattr(st, "iframe"):          # 최신 Streamlit
         st.iframe(twin_html, height="content")
     else:                              # 구버전 호환
@@ -827,6 +915,11 @@ def main():
     ss["anim"] = None
     st.caption("3D 장면의 소재 이동, 온도, 속도는 시뮬레이션 값이며 실측 데이터가 아닙니다. "
                "F1~F5 하중과 압하 배분은 AI 예측(임시 모델) 값이고, 이용률은 과거 최대 하중 대비 값(실제 설비 정격 아님)입니다.")
+    if actual is not None:
+        render_actual_compare(cur, actual, smp)
+    elif smp:
+        st.markdown(f"<div class='alert info'>코일 {smp['id']}의 조건이 바뀌어 실측과 비교할 수 없습니다. 바꾼 조건의 하중은 모델 예측값입니다.</div>",
+                    unsafe_allow_html=True)
 
     # ---- 경고 + AI Agent
     left, right = st.columns([5, 4])
